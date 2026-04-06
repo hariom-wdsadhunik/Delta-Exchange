@@ -22,6 +22,8 @@ class Config:
     # API credentials (required for future private channels; loaded from env only)
     api_key: str = field(default_factory=lambda: os.getenv("DELTA_API_KEY", ""))
     api_secret: str = field(default_factory=lambda: os.getenv("DELTA_API_SECRET", ""))
+    live_trading: bool = False
+    use_testnet: bool = True
 
     # Order book depth kept locally
     orderbook_depth: int = 10
@@ -96,4 +98,17 @@ def load_config() -> Config:
         c.max_position_contracts = float(v)
     if v := os.getenv("MAX_TRADES_PER_MINUTE"):
         c.max_trades_per_minute = int(v)
+    if (v := os.getenv("LIVE_TRADING")) is not None:
+        c.live_trading = _parse_bool(v, default=c.live_trading)
+    if (v := os.getenv("USE_TESTNET")) is not None:
+        c.use_testnet = _parse_bool(v, default=c.use_testnet)
     return c
+
+
+def _parse_bool(value: str, *, default: bool) -> bool:
+    v = value.strip().lower()
+    if v in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if v in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    return default
