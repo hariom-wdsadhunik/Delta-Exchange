@@ -1,5 +1,5 @@
 """
-Delta Exchange DEMO — retail HFT-style limit-order simulator (market data + simulated execution).
+Simulator main loop: market data → book → strategy → execution → PnL / risk → stats.
 """
 
 from __future__ import annotations
@@ -9,16 +9,21 @@ import time
 from queue import Empty, Queue
 
 from config import load_config
-from data_feed import DeltaPublicFeed, MockOrderBookFeed, apply_queue_item_to_book
-from execution import ExecutionSimulator, plan_orders_for_signal
+from data_feed import (
+    DeltaPublicFeed,
+    MockOrderBookFeed,
+    apply_queue_item_to_book,
+)
+from execution_engine import ExecutionEngine
+from execution_types import OrderSide
 from logger import get_logger, log_event, setup_logging
 from orderbook import LocalOrderBook
 from pnl import PnLEngine
 from risk import RiskManager
-from strategy import Signal, StrategyEngine
+from strategy_engine import Signal, StrategyEngine
 
 
-def _drain_queue(q: Queue, cfg, book: LocalOrderBook, max_burst: int = 500) -> int:
+def _drain_book_queue(q: Queue, cfg, book: LocalOrderBook, max_burst: int = 200) -> int:
     n = 0
     for _ in range(max_burst):
         try:
@@ -30,147 +35,144 @@ def _drain_queue(q: Queue, cfg, book: LocalOrderBook, max_burst: int = 500) -> i
     return n
 
 
-def _sanity_checks(cfg, book: LocalOrderBook, pnl: PnLEngine, log) -> None:
-    if abs(pnl.state.position) > cfg.max_position_contracts + 1e-6:
-        log.error(
-            "SANITY: position exceeds max |pos|=%s max=%s",
-            pnl.state.position,
-            cfg.max_position_contracts,
-        )
-    for i, cap in enumerate(pnl.state.fill_liquidity_caps[-50:]):
-        if cap <= 0 and pnl.state.trade_count > 0:
-            log.warning("SANITY: non-positive liquidity cap recorded")
-    sp = book.spread()
-    if sp is not None and sp < 0:
-        log.error("SANITY: negative spread %s", sp)
+def _apply_fills(
+    fills,
+    pnl: PnLEngine,
+    risk: RiskManager,
+    now_mono: float,
+) -> None:
+    for fill in fills:
+        cap = max(fill.quantity, 1e-12)
+        if fill.side == OrderSide.BUY:
+            pnl.apply_buy(fill.price, fill.quantity, cap)
+        else:
+            pnl.apply_sell(fill.price, fill.quantity, cap)
+        risk.record_trade(now_mono)
 
 
-def run(mock: bool) -> None:
+def _submit_intents(
+    intents,
+    execution: ExecutionEngine,
+    risk: RiskManager,
+    position: float,
+    now_mono: float,
+) -> int:
+    submitted = 0
+    for intent in intents:
+        side = "buy" if intent.side == OrderSide.BUY else "sell"
+        ok, reason = risk.can_open(side, intent.quantity, position, now_mono)
+        if not ok:
+            log_event("risk_block_submit", side=side, reason=reason)
+            continue
+        res = execution.submit_order(intent, now_mono, position)
+        if res.accepted:
+            submitted += 1
+            log_event("order_submitted", order_id=res.order_id, side=side)
+        else:
+            log_event("execution_reject", reason=res.reason, side=side)
+    return submitted
+
+
+def run(*, mock: bool) -> None:
     setup_logging()
     log = get_logger()
     cfg = load_config()
 
-    if not mock and not cfg.api_key:
-        log.warning(
-            "DELTA_API_KEY not set — public market data does not require it; "
-            "keys are loaded from .env for consistency and future private channels."
-        )
-
     book = LocalOrderBook(depth=cfg.orderbook_depth)
     pnl = PnLEngine(cfg)
     risk = RiskManager(cfg)
-    strategy = StrategyEngine(cfg)
-    execution = ExecutionSimulator(cfg, pnl)
+    execution = ExecutionEngine(
+        cfg.max_position_contracts,
+        order_timeout_sec=cfg.order_timeout_sec,
+    )
+    strategy = StrategyEngine(
+        symbol=cfg.symbol,
+        base_order_size=cfg.order_size_contracts,
+        min_spread_abs=cfg.min_spread_abs,
+        imbalance_levels=cfg.imbalance_levels,
+        imbalance_threshold=cfg.imbalance_threshold,
+        spread_wide_for_both=cfg.spread_wide_for_both,
+        inventory_skew_enabled=cfg.inventory_skew_enabled,
+        inventory_skew_per_contract=cfg.inventory_skew_per_contract,
+        max_position=cfg.max_position_contracts,
+        cooldown_sec=cfg.strategy_cooldown_sec,
+        spread_median_spike_threshold=(
+            cfg.max_spread_vs_median_ratio if cfg.volatility_filter_enabled else None
+        ),
+    )
 
     q: Queue = Queue()
+    feed = MockOrderBookFeed(cfg, q) if mock else DeltaPublicFeed(cfg, q)
+    feed.start()
+    log.info("Feed started (mock=%s) symbol=%s", mock, cfg.symbol)
 
-    if mock:
-        feed = MockOrderBookFeed(cfg, q)
-        feed.start()
-        log.info("Mock data feed running (no WebSocket).")
-    else:
-        ws = DeltaPublicFeed(cfg, q)
-        ws.start()
-        log.info("Live WebSocket feed: %s symbol=%s", cfg.ws_public_url, cfg.symbol)
-
-    last_signal_time = 0.0
-    orders_submitted = 0
-    last_stats = time.monotonic()
-    updates_seen = 0
-    last_logged_signal: Signal | None = None
+    last_stats_mono = time.monotonic()
+    loop_count = 0
 
     try:
         while True:
-            _drain_queue(q, cfg, book)
-            sp = book.spread() or 0.0
-            sz = strategy.spread_zscore(sp)
-
-            tc0 = pnl.state.trade_count
-            execution.on_book_update(book, sz)
-            d_trades = pnl.state.trade_count - tc0
-            for _ in range(d_trades):
-                risk.record_trade()
+            t_mono = time.monotonic()
+            _drain_book_queue(q, cfg, book)
 
             mid = book.mid()
-            if mid is None:
-                time.sleep(0.05)
-                continue
+            pos = pnl.state.position
 
-            sig, meta = strategy.evaluate(book, pnl.state.position)
-            if sig != Signal.NONE and sig != last_logged_signal:
+            out = strategy.evaluate(book, pos, t_mono, cfg.symbol)
+
+            if out.intents and out.signal != Signal.NONE:
                 log_event(
-                    "signal",
-                    signal=sig.value,
-                    **{k: meta[k] for k in meta if k != "reason"},
+                    "strategy_emit",
+                    signal=out.signal.value,
+                    n_intents=len(out.intents),
+                    imb=out.imbalance,
+                    imb_delta=out.imbalance_delta,
+                    imb_eff=out.effective_imbalance,
                 )
-                last_logged_signal = sig
-            elif sig == Signal.NONE:
-                last_logged_signal = None
+                _submit_intents(out.intents, execution, risk, pos, t_mono)
 
-            now = time.monotonic()
-            if (
-                sig != Signal.NONE
-                and now - last_signal_time >= cfg.strategy_cooldown_sec
-                and execution.active_order_count() < 4
-            ):
-                for side, px, sz_ in plan_orders_for_signal(sig, book, cfg):
-                    ok, reason = risk.can_open(side, sz_, pnl.state.position)
-                    if not ok:
-                        log_event("risk_block", side=side, reason=reason)
-                        continue
-                    execution.submit_limit(side, px, sz_)
-                    orders_submitted += 1
-                last_signal_time = now
+            fills = execution.process_tick(book, t_mono, pos)
+            if fills:
+                log_event("fills_tick", n=len(fills))
+            _apply_fills(fills, pnl, risk, t_mono)
 
-            updates_seen += 1
-            if now - last_stats >= cfg.stats_interval_sec:
-                last_stats = now
-                _sanity_checks(cfg, book, pnl, log)
-                filled_orders = sum(
-                    1 for o in execution.orders.values() if o.status.name == "FILLED"
-                )
-                fill_rate = (pnl.state.trade_count / orders_submitted) if orders_submitted else 0.0
+            loop_count += 1
+            if t_mono - last_stats_mono >= cfg.stats_interval_sec:
+                last_stats_mono = t_mono
+                mark = mid if mid is not None else 0.0
+                ur = pnl.unrealized(mark) if mid is not None else 0.0
                 log.info(
-                    "STATS | mid=%.4f spread=%.4f | pos=%.4f | trades=%s | "
-                    "orders_submitted=%s fill_rate_trades_per_order=%.3f | "
-                    "realized=%.4f unrealized=%.4f fees=%.4f balance=%.4f | "
-                    "active_orders=%s book_updates=%s",
-                    mid,
-                    sp,
+                    "STATS | balance=%.4f position=%.4f trades=%s | "
+                    "realized_pnl=%.4f unrealized_pnl=%.4f fees=%.4f | mid=%s loops=%s",
+                    pnl.state.balance,
                     pnl.state.position,
                     pnl.state.trade_count,
-                    orders_submitted,
-                    fill_rate,
                     pnl.state.realized_pnl,
-                    pnl.unrealized(mid),
+                    ur,
                     pnl.state.fees_paid,
-                    pnl.state.balance,
-                    execution.active_order_count(),
-                    updates_seen,
+                    f"{mid:.4f}" if mid is not None else "n/a",
+                    loop_count,
                 )
                 print(
-                    f"[LIVE] pos={pnl.state.position:.4f} trades={pnl.state.trade_count} "
-                    f"fill_rate={fill_rate:.3f} realized={pnl.state.realized_pnl:.4f} "
-                    f"unrealized={pnl.unrealized(mid):.4f} fees={pnl.state.fees_paid:.4f}",
+                    f"[STATS] balance={pnl.state.balance:.2f} pos={pnl.state.position:.4f} "
+                    f"trades={pnl.state.trade_count} "
+                    f"realized={pnl.state.realized_pnl:.4f} unrealized={ur:.4f} "
+                    f"fees={pnl.state.fees_paid:.4f}",
                     flush=True,
                 )
 
             time.sleep(0.02)
     except KeyboardInterrupt:
-        log.info("Interrupted — shutting down.")
+        log.info("Stopped by user.")
     finally:
-        if mock:
-            feed.stop()
-        else:
-            ws.stop()
+        feed.stop()
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Delta DEMO HFT-style simulator")
+    p = argparse.ArgumentParser(description="Delta demo trading simulator loop")
     p.add_argument(
         "--mock",
         action="store_true",
-        help="Run with synthetic order book (no API connection).",
+        help="Use synthetic order book feed (no WebSocket).",
     )
     args = p.parse_args()
     run(mock=args.mock)
